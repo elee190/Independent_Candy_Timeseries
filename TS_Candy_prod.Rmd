@@ -1,0 +1,712 @@
+---
+title: "Candy Production Forecasting"
+author: "Edward Lee"
+date: "May 31, 2023"
+output:
+  html_document: default
+  word_document: default
+  pdf_document: 
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(comment='', results='hold', echo = TRUE)
+```
+
+```{r}
+# Load necessary packages
+library(tseries)
+library(fpp)
+library(ggplot2)
+library(forecast)
+library(TSA)
+library(vars)
+
+setwd("C:/Users/mars_/Documents/Rcode")
+# Load candy dataset
+candy_production <- read.csv('candy_production.csv')
+# Load personal consumption expenditures dataset
+consumption_expense <- read.csv('PCE.csv')
+consumption_expense <- consumption_expense[157:720,]
+# Create time series objects
+candy_ts <- ts(candy_production$IPG3113N, start=c(1972,1), frequency=12)
+consumption_ts <- ts(consumption_expense$PCE, start=c(1972,1), frequency=12)
+data_ts <- cbind(candy_ts,consumption_ts)
+# Plot them
+plot(candy_ts, ylab = "Candy", main="Monthly - Candy Production", panel.first = grid())
+plot(consumption_ts, ylab = "Consumption", main="Monthly - Personal Consumption Expenditures", panel.first = grid())
+
+# Split dataset into training and test
+training_ts <- window(candy_ts, start=c(1972,1), end=c(2017,12), f=12)
+test_ts <- window(candy_ts, start=c(2018,1), end=c(2018,12), f=12)
+training_con_ts <- window(consumption_ts, start=c(1972,1), end=c(2017,12), f=12)
+test_con_ts <- window(consumption_ts, start=c(2018,1), end=c(2018,12), f=12)
+
+```
+
+Box-Cox transformation is necessary for this data, since the data in the plot shows variance is unstable with the level of the series. We can also see that the data has seasonality ans slightly upward trend.
+After applying Box-Cox transformation, the variance is stablized.
+```{r}
+plot(training_ts, ylab = "Candy", main="Monthly - Candy Production", panel.first = grid())
+lmd <- BoxCox.lambda(training_ts, upper = 3)
+lmd1 <- BoxCox.lambda(consumption_ts)
+plot(training_ts %>% BoxCox(lambda = lmd), ylab = "Candy", main="Monthly - Candy Production BoxCox Transformation", panel.first = grid())
+data_ts <- cbind(data_ts,"transCandy" = candy_ts %>% BoxCox(lambda = lmd), "transCon" = consumption_ts %>% BoxCox(lambda = lmd1))
+```
+
+Our goal here is to ensure the training ts and exogenous variable are both stationary.\
+After applying a seasonal difference on the training time series, we still see some seasonality in the ACF plot. After applying non-seasonal differenceing, although some spikes appeared in both ACF and PACF plots, the majority of lags are within the threshold range.\
+For the exogenous variable, we apply Box-Cox transformation since the variance is not stable. After applying non-seasonal differenceing, the majority of lags are within the threshold range.
+```{r}
+# Apply Box Cox transformation, and take a seasonal difference on the data
+training_ts_t <- diff(training_ts %>% BoxCox(lambda = lmd), lag=12)
+Acf(training_ts_t, lag.max = 240, main="ACF with seasonal difference (lag=12 D=1)")
+Pacf(training_ts_t, lag.max = 240, main="PACF with seasonal difference (lag=12 D=1)")
+# Apply first order diff on seasonal difference as there is some seasonality in first order ACF plot
+training_ts_t2 <- diff(training_ts_t)
+Acf(training_ts_t2, lag.max = 240, main="ACF with seasonal and non-seasonal differences (lag=12 D=1 d=1)")
+Pacf(training_ts_t2, lag.max = 240, main="PACF with seasonal and non-seasonal differences (lag=12 D=1 d=1)")
+
+# Apply Box Cox transformation, and take a non-seasonal difference on the exogenous variable
+# since there is no seasonal pattern on this dataset
+consumption_ts_t <- diff(consumption_ts %>% BoxCox(lambda = lmd1))
+Acf(consumption_ts_t, lag.max = 240, main="ACF with non-seasonal difference (d=1) for exogenous variable")
+Pacf(consumption_ts_t, lag.max = 240, main="PACF with non-seasonal difference (d=1) for exogenous variable")
+
+```
+
+Both KPSS and ADF plots confirm the transformed training dataset and exogenous variable are now stationary.
+```{r}
+kpss.test(training_ts_t2)
+# p-value = 0.1 > 0.05 ==> Accept Null hypothesis ==> The process is stationary.
+adf.test(training_ts_t2)
+# p-value = 0.01 < 0.05 ==> Accept alternative hypothesis ==> The process is stationary.
+autoplot(training_ts_t2, main="Plot for transformed training ts")
+
+kpss.test(consumption_ts_t)
+# p-value = 0.1 > 0.05 ==> Accept Null hypothesis ==> The process is stationary.
+adf.test(consumption_ts_t)
+# p-value = 0.01 < 0.05 ==> Accept alternative hypothesis ==> The process is stationary.
+autoplot(consumption_ts_t, main="Plot for transformed exogenous variable")
+```
+
+Fit sarima model and test if residuals resemble white noise. Here, we assign trace outputs to a data frame and selct top 8 sarima models based on AICc. The reason we are doing this way is to ensure the model we pick not only has low AICc value but its residuals resemble white noise. Also, we need to ensure all the coefficients are significant.\ 
+When comparing the best two models, although AICc is slighter lower for ARIMA(2,1,3)(0,1,2)[12], the coefficients for MA1 are not significant from zero, while all coefficients for ARIMA(2,1,2)(0,1,2)[12] are significant from zero. Therefore, we prefer ARIMA(2,1,2)(0,1,2)[12] over ARIMA(2,1,3)(0,1,2)[12]. The order of final sarima model is ARIMA(2,1,2)(0,1,2)[12]. The Ljung-Box test has p value greater than 5%, which indicates the residuals are white noise. The Shapiro-Wilk test has p value less than 5%, which indicates the residuals are not normally distributed.
+```{r message=FALSE, warning=FALSE}
+# Assign trace outputs to a data frame and selct top 8 sarima models based on AICc
+trace <- capture.output({
+    # Set d = 1 as we believe the first and seasonal difference can take off the seasonality on ACF plot
+    fit_arima <- auto.arima(training_ts, d = 1, seasonal=TRUE, lambda = lmd, trace = TRUE)
+})
+con <- textConnection(trace)
+fit_arimas <- read.table(con, sep=":", fill=TRUE, row.names = NULL)
+fit_arimas <- fit_arimas[2:(length(fit_arimas[,1])-3),]
+colnames(fit_arimas) <- c("arima model","AICc approx.")
+fit_arimas8 <- fit_arimas[order(fit_arimas[,2]),][1:8,]
+fit_arimas8
+close(con)
+
+# Fit top 8 sarima models and collect Ljung-Box and Shapiro test results 
+fit_arima1 <- Arima(training_ts, order = c(1,1,2), seasonal = c(0,1,2), lambda = lmd)
+Box.test(fit_arima1$residuals, lag = 12, type = "Ljung")
+shapiro.test(fit_arima1$residuals)
+fit_arima2 <- Arima(training_ts, order = c(1,1,3), seasonal = c(0,1,2), lambda = lmd)
+Box.test(fit_arima2$residuals, lag = 12, type = "Ljung")
+shapiro.test(fit_arima2$residuals)
+fit_arima3 <- Arima(training_ts, order = c(1,1,1), seasonal = c(0,1,2), lambda = lmd)
+Box.test(fit_arima3$residuals, lag = 12, type = "Ljung")
+shapiro.test(fit_arima3$residuals)
+fit_arima4 <- Arima(training_ts, order = c(0,1,2), seasonal = c(0,1,2), lambda = lmd)
+Box.test(fit_arima4$residuals, lag = 12, type = "Ljung")
+shapiro.test(fit_arima4$residuals)
+fit_arima5 <- Arima(training_ts, order = c(2,1,3), seasonal = c(0,1,2), lambda = lmd)
+Box.test(fit_arima5$residuals, lag = 12, type = "Ljung")
+shapiro.test(fit_arima5$residuals)
+fit_arima6 <- Arima(training_ts, order = c(2,1,1), seasonal = c(0,1,2), lambda = lmd)
+Box.test(fit_arima6$residuals, lag = 12, type = "Ljung")
+shapiro.test(fit_arima6$residuals)
+fit_arima7 <- Arima(training_ts, order = c(0,1,3), seasonal = c(0,1,2), lambda = lmd)
+Box.test(fit_arima7$residuals, lag = 12, type = "Ljung")
+shapiro.test(fit_arima7$residuals)
+fit_arima8 <- Arima(training_ts, order = c(2,1,2), seasonal = c(0,1,2), lambda = lmd)
+Box.test(fit_arima8$residuals, lag = 12, type = "Ljung")
+shapiro.test(fit_arima8$residuals)
+
+# Two models are left based on their low AICc value and residuals resembling white noise.
+# They are ARIMA(2,1,2)(0,1,2)[12] and ARIMA(2,1,3)(0,1,2)[12].
+# Let's start with simple model first: ARIMA(2,1,2)(0,1,2)[12].
+summary(fit_arima8)
+# Then ARIMA(2,1,3)(0,1,2)[12].
+summary(fit_arima5)
+# When comparing the two models, although AICc is slighter lower for ARIMA(2,1,3)(0,1,2)[12],
+# the coefficients for ma1 are not significant from zero, while all coefficients for
+# ARIMA(2,1,2)(0,1,2)[12] are significant from zero. Therefore, we prefer ARIMA(2,1,2)(0,1,2)[12]
+# over ARIMA(2,1,3)(0,1,2)[12].
+fit_arima <- Arima(training_ts, order = c(2,1,2), seasonal = c(0,1,2), lambda = lmd)
+summary(fit_arima)
+checkresiduals(fit_arima)
+# Ljung-Box test testing residuals' white noise
+Box.test(fit_arima$residuals, lag = 12, type = "Ljung")
+# Shapiro test testing residuals' normality
+shapiro.test(fit_arima$residuals)
+
+```
+
+Check if overfitting problem exists when fitting ARIMA model.\
+As we can tell, the coefficients change after decreasing p or q by 1. The model assumption is changed if coefficients change.\ 
+Therefore, we conclude the overfitting problem does not exist in the fitted ARIMA model.
+```{r}
+# Decrease q by 1
+fit_arimaA <- Arima(training_ts, order = c(2,1,1), seasonal = c(0,1,2), lambda = lmd)
+summary(fit_arimaA)
+# Decrease p by 1
+fit_arimaB <- Arima(training_ts, order = c(1,1,2), seasonal = c(0,1,2), lambda = lmd)
+summary(fit_arimaB)
+
+```
+
+
+
+We will plot the forecast for sarima model.
+```{r}
+# Forecast with Arima
+predict_arima <- forecast(fit_arima, h = 12)
+
+# Plot the forecasts from Arima
+plot(predict_arima , main = "Forecasts from Arima")
+lines(test_ts, col = "red")
+legend("bottomright",legend=c("Arima forecast","Actual"),col = c("blue", "red"), lwd=c(2.5,1), lty=1)
+
+```
+
+Calculate MAPE and MSE for sarima to evaluate model performance.
+```{r}
+# Calculate MAPE and MSE for arima
+MAPE_arima <- 100*sum(abs(predict_arima$mean-test_ts)/test_ts)/length(test_ts)
+MSE_arima <- sum((predict_arima$mean-test_ts)^2)/length(test_ts)
+```
+
+
+Fit ets model and test if residuals resemble white noise. The order of ets model is ETS(A,N,A). The Ljung-Box test has p value less than 5%, which indicates the residuals are not white noise. The Shapiro-Wilk test has p value less than 5%, which indicates the residuals are not normally distributed.
+```{r}
+# Fit ets model
+fit_ets <- ets(training_ts, lambda = lmd)
+summary(fit_ets)
+checkresiduals(fit_ets)
+# Ljung-Box test testing residuals' white noise
+Box.test(fit_ets$residuals, lag = 12, type = "Ljung")
+# Shapiro test testing residuals' normality
+shapiro.test(fit_ets$residuals)
+```
+
+For ets model, the residuals are not white noise and not normally distributed. Nonetheless, we will plot the forecast.
+```{r}
+# Forecast with ets
+predict_ets <- forecast(fit_ets, h = 12)
+
+# Plot the forecasts from ets
+plot(predict_ets , main = "Forecasts from ETS")
+lines(test_ts, col = "red")
+legend("bottomright",legend=c("ETS forecast","Actual"),col = c("blue", "red"), lwd=c(2.5,1), lty=1)
+
+```
+
+
+Calculate MAPE and MSE for ets to evaluate model performance.
+```{r}
+# Calculate MAPE and MSE for ets
+MAPE_ets <- 100*sum(abs(predict_ets$mean-test_ts)/test_ts)/length(test_ts)
+MSE_ets <- sum((predict_ets$mean-test_ts)^2)/length(test_ts)
+
+```
+
+
+Fit linear regression model with personal consumption expenditures as independent variable and candy production as dependent variable, and test if residuals resemble white noise. The Ljung-Box test has p value less than 5%, which indicates the residuals are not white noise. The Shapiro-Wilk test has p value less than 5%, which indicates the residuals are not normally distributed.
+```{r}
+# Fit linear model
+fit_lm <- tslm(transCandy ~ transCon, data = window(data_ts, start=c(1972,1), end=c(2017,12), f=12))
+summary(fit_lm)
+checkresiduals(fit_lm)
+# Ljung-Box test testing residuals' white noise
+Box.test(fit_lm$residuals, lag = 12, type = "Ljung")
+# Shapiro test testing residuals' normality
+shapiro.test(fit_lm$residuals)
+```
+
+For linear regression model, the residuals are not white noise and not normally distributed. Nonetheless, we will plot the forecast.
+```{r}
+# Forecast with linear
+predict_lm <- forecast(fit_lm, newdata = data.frame(transCon=BoxCox(test_con_ts, lambda = lmd1)))
+# Revert back the forecasted values to the original scale
+predict_lm$mean <- InvBoxCox(predict_lm$mean, lambda = lmd)
+predict_lm$upper <- InvBoxCox(predict_lm$upper, lambda = lmd)
+predict_lm$lower <- InvBoxCox(predict_lm$lower, lambda = lmd)
+predict_lm$x <- InvBoxCox(predict_lm$x, lambda = lmd) 
+
+# Plot the forecasts from linear
+plot(predict_lm, main = "Forecasts from Linear")
+lines(test_ts, col = "red")
+legend("bottomright",legend=c("Linear forecast","Actual"),col = c("blue", "red"), lwd=c(2.5,1), lty=1)
+
+```
+
+
+Calculate MAPE and MSE for linear regression to evaluate model performance.
+```{r}
+# Calculate MAPE and MSE for linear regression
+MAPE_lm <- 100*sum(abs(predict_lm$mean-test_ts)/test_ts)/length(test_ts)
+MSE_lm <- sum((predict_lm$mean-test_ts)^2)/length(test_ts)
+
+```
+
+Fit regression model with ARIMA errors and test if residuals resemble white noise. The order of arima part is ARIMA(2,1,2)(0,1,2)[12]. The Ljung-Box test has p value greater than 5%, which indicates the residuals are white noise. The Shapiro-Wilk test has p value less than 5%, which indicates the residuals are not normally distributed. Note the coeffient for xreg is not significant from 0.
+```{r}
+# Fit regression model with ARIMA errors
+fit_xreg <- Arima(training_ts, order = c(2,1,2), seasonal = c(0,1,2), xreg = BoxCox(training_con_ts, lambda = lmd1), lambda = lmd)
+summary(fit_xreg)
+checkresiduals(fit_xreg)
+# Ljung-Box test testing residuals' white noise
+Box.test(fit_xreg$residuals, lag = 12, type = "Ljung")
+# Shapiro test testing residuals' normality
+shapiro.test(fit_xreg$residuals)
+```
+
+Check if overfitting problem exists when fitting regression model with ARIMA errors.\
+As we can tell, the coefficients change after decreasing p or q by 1. The model assumption is changed if coefficients change.\ 
+Therefore, we conclude the overfitting problem does not exist in the fitted regression model with ARIMA errors.
+```{r}
+# Decrease q by 1
+fit_xregA <- Arima(training_ts, order = c(2,1,1), seasonal = c(0,1,2), xreg = BoxCox(training_con_ts, lambda = lmd1), lambda = lmd)
+summary(fit_xregA)
+# Decrease p by 1
+fit_xregB <- Arima(training_ts, order = c(1,1,2), seasonal = c(0,1,2), xreg = BoxCox(training_con_ts, lambda = lmd1), lambda = lmd)
+summary(fit_xregB)
+
+```
+
+
+We will plot the forecast for regression model with ARIMA errors model.
+```{r}
+# Forecast with regression model with ARIMA errors
+# Here, for xreg I use the test data from consumption since it's given.
+# Theoretically the forecast for xreg has to be forecasted with a ts model.
+predict_xreg <- forecast(fit_xreg, xreg = BoxCox(test_con_ts, lambda = lmd1), h = 12)
+
+# Plot the forecasts from regression model with ARIMA errors
+plot(predict_xreg , main = "Forecasts from regression model with ARIMA error")
+lines(test_ts, col = "red")
+legend("bottomright",legend=c("regression model with ARIMA error forecast","Actual"),col = c("blue", "red"), lwd=c(2.5,1), lty=1)
+
+```
+
+
+Calculate MAPE and MSE for regression model with ARIMA error to evaluate model performance.
+```{r}
+# Calculate MAPE and MSE for regression model with ARIMA error
+MAPE_xreg <- 100*sum(abs(predict_xreg$mean-test_ts)/test_ts)/length(test_ts)
+MSE_xreg <- sum((predict_xreg$mean-test_ts)^2)/length(test_ts)
+
+```
+
+Fit VAR model and test if residuals resemble white noise. The VAR model is VAR(5). The serial.test has p value less than 5%, which indicates the residuals are not white noise. The Shapiro-Wilk test has p value less than 5%, which indicates the residuals are not normally distributed.
+```{r}
+
+# Pick out lag length with Varselect function
+VARselect(window(data_ts, start=c(1972,1), end=c(2017,12), f=12)[,3:4], type = "both", season = 12)$selection
+# AIC(n)  HQ(n)  SC(n) FPE(n) 
+#      5      5      2      5 
+
+# Will iterate p from 2 and 5, and test if the residuals resemble 
+# serial correlation
+var2 <- VAR(window(data_ts, start=c(1972,1), end=c(2017,12), f=12)[,3:4], p = 2, type = "both", season = 12)
+serial.test(var2, type = "PT.asymptotic")
+var3 <- VAR(window(data_ts, start=c(1972,1), end=c(2017,12), f=12)[,3:4], p = 3, type = "both", season = 12)
+serial.test(var3, type = "PT.asymptotic")
+var4 <- VAR(window(data_ts, start=c(1972,1), end=c(2017,12), f=12)[,3:4], p = 4, type = "both", season = 12)
+serial.test(var4, type = "PT.asymptotic")
+var5 <- VAR(window(data_ts, start=c(1972,1), end=c(2017,12), f=12)[,3:4], p = 5, type = "both", season = 12)
+serial.test(var5, type = "PT.asymptotic")
+
+# All the 4 models above do not resemble white noise residuals. Nonetheless, we pick up VAR(5)
+# based on its higher p value and lowest AIC value.
+AICs <- VARselect(window(data_ts, start=c(1972,1), end=c(2017,12), f=12)[,3:4], type = "both", season = 12)$criteria["AIC(n)",2:5]
+AICs
+fit_var <- VAR(window(data_ts, start=c(1972,1), end=c(2017,12), f=12)[,3:4], p = 5, type = "both", season = 12)
+# Serial correlation test to test if serial correlation presents in the residuals
+serial.test(fit_var, type = "PT.asymptotic")
+# Shapiro test testing residuals' normality
+shapiro.test(residuals(fit_var)[,1])
+
+```
+
+We will plot the VAR model.
+```{r}
+# Forecast with VAR model
+predict_var <- forecast(fit_var, h = 12)
+# Revert back the forecasted values to the original scale
+predict_var$forecast$transCandy$mean <- InvBoxCox(predict_var$forecast$transCandy$mean, lambda = lmd)
+predict_var$forecast$transCandy$upper <- InvBoxCox(predict_var$forecast$transCandy$upper, lambda = lmd)
+predict_var$forecast$transCandy$lower <- InvBoxCox(predict_var$forecast$transCandy$lower, lambda = lmd)
+predict_var$forecast$transCandy$x <- InvBoxCox(predict_var$forecast$transCandy$x, lambda = lmd)
+predict_var$forecast$transCon$mean <- InvBoxCox(predict_var$forecast$transCon$mean, lambda = lmd)
+predict_var$forecast$transCon$upper <- InvBoxCox(predict_var$forecast$transCon$upper, lambda = lmd)
+predict_var$forecast$transCon$lower <- InvBoxCox(predict_var$forecast$transCon$lower, lambda = lmd)
+predict_var$forecast$transCon$x <- InvBoxCox(predict_var$forecast$transCon$x, lambda = lmd)
+
+# Plot the VAR model
+plot(predict_var$forecast$transCandy, main = "Forecasts from VAR model")
+lines(test_ts, col = "red")
+legend("bottomright",legend=c("VAR model","Actual"),col = c("blue", "red"), lwd=c(2.5,1), lty=1)
+
+```
+
+
+Calculate MAPE and MSE for VAR model to evaluate model performance.
+```{r}
+# Calculate MAPE and MSE for VAR model
+MAPE_var <- 100*sum(abs(predict_var$forecast$transCandy$mean-test_ts)/test_ts)/length(test_ts)
+MSE_var <- sum((predict_var$forecast$transCandy$mean-test_ts)^2)/length(test_ts)
+
+```
+
+
+Fit Fourier terms with ARIMA errors and test if residuals resemble white noise. The order of arima part is ARIMA(0,1,2) and fourier term is K=6. The Ljung-Box test has p value less than 5%, which indicates the residuals are not white noise. The Shapiro-Wilk test has p value less than 5%, which indicates the residuals are not normally distributed.
+```{r}
+# Loop thru K to find the best Fourier terms based on AICc value
+bestfit <- list(aicc=Inf)
+for (i in 1:6) {
+  fit <- auto.arima(training_ts, d=1, xreg = BoxCox(fourier(training_ts, K=i), lambda = lmd), lambda = lmd, seasonal = FALSE)
+  if (fit$aicc < bestfit$aicc)
+    bestfit <- fit
+}
+
+bestfit #best Fourier terms with ARIMA errors has K=6.
+
+# Fit Fourier terms with ARIMA errors
+fit_four <- auto.arima(training_ts, d=1, xreg = BoxCox(fourier(training_ts, K=6), lambda = lmd), lambda = lmd, seasonal = FALSE)
+summary(fit_four)
+checkresiduals(fit_four)
+# Ljung-Box test testing residuals' white noise
+Box.test(fit_four$residuals, lag = 12, type = "Ljung")
+# Shapiro test testing residuals' normality
+shapiro.test(fit_four$residuals)
+```
+
+We will plot the forecast for fourier terms with ARIMA errors model.
+```{r}
+# Forecast with Fourier terms with ARIMA errors
+predict_four <- forecast(fit_four, xreg = BoxCox(fourier(training_ts, K=6, h = 12), lambda = lmd))
+
+# Plot the forecasts from Fourier terms with ARIMA errors
+plot(predict_four , main = "Forecasts from fourier terms with ARIMA error")
+lines(test_ts, col = "red")
+legend("bottomright",legend=c("Fourier terms with ARIMA error forecast","Actual"),col = c("blue", "red"), lwd=c(2.5,1), lty=1)
+
+```
+
+
+Calculate MAPE and MSE for Fourier terms with ARIMA error to evaluate model performance.
+```{r}
+# Calculate MAPE and MSE for Fourier terms with ARIMA error
+MAPE_four <- 100*sum(abs(predict_four$mean-test_ts)/test_ts)/length(test_ts)
+MSE_four <- sum((predict_four$mean-test_ts)^2)/length(test_ts)
+
+```
+
+
+Fit ARFIMA model and test if residuals resemble white noise. The fractional D is 0.482. The Ljung-Box test has p value less than 5%, which indicates the residuals are not white noise. The Shapiro-Wilk test has p value less than 5%, which indicates the residuals are not normally distributed.
+```{r message=FALSE, warning=FALSE}
+# Check ACF plot for training dataset. The plot does manifest
+# some long memory characteristics as the auto correlation does
+# not decay quickly.
+Acf(training_ts, lag.max = 240, main="ACF with training dataset")
+
+# Fit ARFIMA model
+fit_arfi <- arfima(training_ts, lambda = lmd)
+summary(fit_arfi)
+checkresiduals(fit_arfi)
+# Ljung-Box test testing residuals' white noise
+Box.test(fit_arfi$residuals, lag = 12, type = "Ljung")
+# Shapiro test testing residuals' normality
+shapiro.test(fit_arfi$residuals)
+```
+
+We will plot the forecast for ARFIMA model.
+```{r message=FALSE, warning=FALSE}
+# Forecast with ARFIMA model
+predict_arfi <- forecast(fit_arfi, h = 12)
+
+# Plot the forecasts from ARFIMA model
+plot(predict_arfi , main = "Forecasts from ARFIMA model")
+lines(test_ts, col = "red")
+legend("bottomright",legend=c("ARFIMA model forecast","Actual"),col = c("blue", "red"), lwd=c(2.5,1), lty=1)
+
+```
+
+
+Calculate MAPE and MSE for ARFIMA model to evaluate model performance.
+```{r}
+# Calculate MAPE and MSE for ARFIMA model
+MAPE_arfi <- 100*sum(abs(predict_arfi$mean-test_ts)/test_ts)/length(test_ts)
+MSE_arfi <- sum((predict_arfi$mean-test_ts)^2)/length(test_ts)
+
+```
+
+Fit TBATS model and test if residuals resemble white noise. The order of the model is TBATS(1, {1,3}, -, {<12,5>}). The Ljung-Box test has p value less than 5%, which indicates the residuals are not white noise. The Shapiro-Wilk test has p value less than 5%, which indicates the residuals are not normally distributed.
+```{r}
+# Fit TBATS model
+fit_tb <- tbats(training_ts)
+summary(fit_tb)
+checkresiduals(fit_tb)
+# Ljung-Box test testing residuals' white noise
+Box.test(residuals(fit_tb), lag = 12, type = "Ljung")
+# Shapiro test testing residuals' normality
+shapiro.test(residuals(fit_tb))
+```
+
+We will plot the forecast for TBATS model.
+```{r message=FALSE, warning=FALSE}
+# Forecast with TBATS model
+predict_tb <- forecast(fit_tb, h = 12)
+
+# Plot the forecasts from TBATS model
+plot(predict_tb , main = "Forecasts from TBATS model")
+lines(test_ts, col = "red")
+legend("bottomright",legend=c("TBATS model forecast","Actual"),col = c("blue", "red"), lwd=c(2.5,1), lty=1)
+
+```
+
+
+Calculate MAPE and MSE for TBATS model to evaluate model performance.
+```{r}
+# Calculate MAPE and MSE for TBATS model
+MAPE_tb <- 100*sum(abs(predict_tb$mean-test_ts)/test_ts)/length(test_ts)
+MSE_tb <- sum((predict_tb$mean-test_ts)^2)/length(test_ts)
+
+```
+
+
+Fit intervention model and test if residuals resemble white noise. The order of arima part is ARIMA(3,1,3)(0,1,2)[12]. For the intervention specification, I tend to model in a way that match the mean of the original plot. The Ljung-Box test has p value greater than 5%, which indicates the residuals are white noise. The Shapiro-Wilk test has p value less than 5%, which indicates the residuals are not normally distributed.
+```{r}
+# Plot decomposition of training ts
+autoplot(mstl(training_ts), main="Decomposition of training ts")
+# Fit intervention model. The best model is picked for trace outputs.
+fit_intv <- Arima(training_ts, order = c(3,1,3), seasonal = c(0,1,2), xreg = ts(c(1:344,seq(344, 106, by = -2),106:193), start=c(1972,1), frequency=12), lambda = lmd)
+summary(fit_intv)
+checkresiduals(fit_intv)
+# Ljung-Box test testing residuals' white noise
+Box.test(fit_intv$residuals, lag = 12, type = "Ljung")
+# Shapiro test testing residuals' normality
+shapiro.test(fit_intv$residuals)
+```
+
+Check if overfitting problem exists when fitting intervention model.\
+As we can tell, the coefficients change after decreasing p or q by 1. The model assumption is changed if coefficients change.\ 
+Therefore, we conclude the overfitting problem does not exist in the fitted intervention model.
+```{r}
+# Decrease q by 1
+fit_intvA <- Arima(training_ts, order = c(3,1,2), seasonal = c(0,1,2), xreg = ts(c(1:344,seq(344, 106, by = -2),106:193), start=c(1972,1), frequency=12), lambda = lmd)
+summary(fit_intvA)
+# Decrease p by 1
+fit_intvB <- Arima(training_ts, order = c(2,1,3), seasonal = c(0,1,2), xreg = ts(c(1:344,seq(344, 106, by = -2),106:193), start=c(1972,1), frequency=12), lambda = lmd)
+summary(fit_intvB)
+
+```
+
+
+We will plot the forecast for intervention model.
+```{r}
+# Forecast with intervention model
+predict_intv <- forecast(fit_intv, xreg = ts(193:204, start=c(2018,1), frequency=12), h = 12)
+
+# Plot the forecasts from intervention model
+plot(predict_intv , main = "Forecasts from intervention model")
+lines(test_ts, col = "red")
+legend("bottomright",legend=c("intervention model forecast","Actual"),col = c("blue", "red"), lwd=c(2.5,1), lty=1)
+
+```
+
+
+Calculate MAPE and MSE for intervention model to evaluate model performance.
+```{r}
+# Calculate MAPE and MSE for intervention model
+MAPE_intv <- 100*sum(abs(predict_intv$mean-test_ts)/test_ts)/length(test_ts)
+MSE_intv <- sum((predict_intv$mean-test_ts)^2)/length(test_ts)
+
+```
+
+Aggregate model performance measurements together.
+```{r}
+error_table <- as.data.frame(rbind(c(round(MAPE_arima,4),round(MSE_arima,4),round(fit_arima$aicc,4),"YES","YES"),
+                                   c(round(MAPE_ets,4),round(MSE_ets,4),round(fit_ets$aicc,4),"NO","N/A"),
+                                   c(round(MAPE_lm,4),round(MSE_lm,4),round(extractAIC(fit_lm)[2],4),"NO","YES"),
+                                   c(round(MAPE_xreg,4),round(MSE_xreg,4),round(fit_xreg$aicc,4),"YES","NO"),
+                                   c(round(MAPE_var,4),round(MSE_var,4),round(AICs[4],4),"NO","NO"),
+                                   c(round(MAPE_four,4),round(MSE_four,4),round(fit_four$aicc,4),"NO","NO"),
+                                   c(round(MAPE_arfi,4),round(MSE_arfi,4),round(summary(fit_arfi)$aic,4),"NO","N/A"),
+                                   c(round(MAPE_tb,4),round(MSE_tb,4),round(fit_tb$AIC,4),"NO","N/A"),
+                                   c(round(MAPE_intv,4),round(MSE_intv,4),round(fit_intv$aicc,4),"YES","YES")), row.names = c("Arima model","ETS model","Linear regression",
+                                                                                          "regr model (ARIMA errs)","VAR model",
+                                                                                          "Fourier mdl (ARIMA errs)","ARFIMA model",
+                                                                                          "TBATS model","intervention model"))
+colnames(error_table) <- c("MAPE","MSE","AICc/AIC","Residual white noise","Coefficient significance")
+error_table
+
+```
+
+So for model evaluation, our first criteria is the residuals must resemble white noise. Given this, only three models are left. They are Arima model, regression model with ARIMA errors and intervention model.\
+We will add another metric called coefficient significance. That is, whether all the coefficients in the model are significant or not. We will only accept model that all the coefficients are significant.\
+Next, we will look at the corresponding MAPE and MSE and determine which one is our final selection. Here the rank of importance of these metrics from high to low are MAPE and MSE. Our final model is intervention model given its best performance in MAPE and MSE, and in AICc compared with ARIMA and regression model with ARIMA errors.\
+Note although we include AICc/AIC for all the models, they are not comparable as AICc/AIC involve a constant that different fitting algorithms set to different values. The only time that AICc/AIC is comparable is when the underlying method for different models are the same, such as ARIMA, regression model with ARIMA errors, fourier model with ARIMA errors and intervention model.
+
+```{r}
+error_table_final <- error_table[c("Arima model","regr model (ARIMA errs)","intervention model"),]
+error_table_final
+
+```
+
+We still have room for improvement. For example, we can apply expanding or sliding windows to further enhance the model performance.
+```{r message=FALSE, warning=FALSE}
+## Set up parameters
+k <- length(training_ts) # minimum data length for fitting a model
+n <- length(candy_ts) # Number of data points
+p <- 12 ### Period
+H <- 12 # Forecast Horiz
+defaultW <- getOption("warn") 
+options(warn = -1)
+st <- tsp(candy_ts)[1]+(k-2)/p #  gives the start time in time units
+
+# Set up MAPE, MSE and AICc matrix for each model
+mape_1 <- matrix(NA,n-k,H)
+mape_2 <- matrix(NA,n-k,H)
+mape_3 <- matrix(NA,n-k,H)
+mape_4 <- matrix(NA,n-k,H)
+mape_5 <- matrix(NA,n-k,H)
+mape_6 <- matrix(NA,n-k,H)
+mse_1 <- matrix(NA,n-k,H)
+mse_2 <- matrix(NA,n-k,H)
+mse_3 <- matrix(NA,n-k,H)
+mse_4 <- matrix(NA,n-k,H)
+mse_5 <- matrix(NA,n-k,H)
+mse_6 <- matrix(NA,n-k,H)
+aicc_1 <- matrix(NA,n-k,H)
+aicc_2 <- matrix(NA,n-k,H)
+aicc_3 <- matrix(NA,n-k,H)
+aicc_4 <- matrix(NA,n-k,H)
+aicc_5 <- matrix(NA,n-k,H)
+aicc_6 <- matrix(NA,n-k,H)
+
+
+# Loop through all folds to obtain MAE, RMSE and AICc
+for(i in 1:(n-k))
+{
+  ### One Month rolling forecasting
+  # Expanding Window 
+  train_1 <- window(candy_ts, end=st + i/p)  ## Window Length: k+i
+  
+  # Sliding Window - keep the training window of fixed length. 
+  # The training set always consists of k observations.
+  train_2 <- window(candy_ts, start=st+(i-k+1)/p, end=st+i/p) ## Window Length: k
+  test <- window(candy_ts, start=st + (i+1)/p, end=st + (i+H)/p) ## Window Length: H
+  
+  # Fit 6 models
+  fit_1 <- Arima(train_1, order = c(2,1,2), seasonal = c(0,1,2), lambda = lmd)
+  fcast_1 <- forecast(fit_1, h=H)
+  fit_2 <- Arima(train_2, order = c(2,1,2), seasonal = c(0,1,2), lambda = lmd)
+  fcast_2 <- forecast(fit_2, h=H)
+  fit_3 <- Arima(train_1, order = c(2,1,2), seasonal = c(0,1,2), xreg = BoxCox(window(consumption_ts, end=st + i/p), lambda = lmd1), lambda = lmd)
+  fcast_3 <- forecast(fit_3, xreg = BoxCox(test_con_ts, lambda = lmd1), h = H)
+  fit_4 <- Arima(train_2, order = c(2,1,2), seasonal = c(0,1,2), xreg = BoxCox(window(consumption_ts, start=st+(i-k+1)/p, end=st+i/p), lambda = lmd1), lambda = lmd)
+  fcast_4 <- forecast(fit_4, xreg = BoxCox(test_con_ts, lambda = lmd1), h = H)
+  fit_5 <- Arima(train_1, order = c(3,1,3), seasonal = c(0,1,2), xreg = window(ts(c(1:344,seq(344, 106, by = -2),106:193,193:204), start=c(1972,1), frequency=12), end=st + i/p), lambda = lmd, method="ML")
+  fcast_5 <- forecast(fit_5, xreg = ts(193:204, start=c(2018,1), frequency=12), h = H)
+  fit_6 <- Arima(train_2, order = c(3,1,3), seasonal = c(0,1,2), xreg = window(ts(c(1:344,seq(344, 106, by = -2),106:193,193:204), start=c(1972,1), frequency=12), start=st+(i-k+1)/p, end=st+i/p), lambda = lmd, method="ML")
+  fcast_6 <- forecast(fit_6, xreg = ts(193:204, start=c(2018,1), frequency=12), h = H)
+  # Calculate MAPE, RMSE and AICc
+  mape_1[i,1:length(test)] <- 100*sum(abs(fcast_1[['mean']]-test)/test)/H
+  mape_2[i,1:length(test)] <- 100*sum(abs(fcast_2[['mean']]-test)/test)/H
+  mape_3[i,1:length(test)] <- 100*sum(abs(fcast_3[['mean']]-test)/test)/H
+  mape_4[i,1:length(test)] <- 100*sum(abs(fcast_4[['mean']]-test)/test)/H
+  mape_5[i,1:length(test)] <- 100*sum(abs(fcast_5[['mean']]-test)/test)/H
+  mape_6[i,1:length(test)] <- 100*sum(abs(fcast_6[['mean']]-test)/test)/H
+  
+  mse_1[i,1:length(test)] <- sum((fcast_1[['mean']]-test)^2)/H
+  mse_2[i,1:length(test)] <- sum((fcast_2[['mean']]-test)^2)/H
+  mse_3[i,1:length(test)] <- sum((fcast_3[['mean']]-test)^2)/H
+  mse_4[i,1:length(test)] <- sum((fcast_4[['mean']]-test)^2)/H
+  mse_5[i,1:length(test)] <- sum((fcast_5[['mean']]-test)^2)/H
+  mse_6[i,1:length(test)] <- sum((fcast_6[['mean']]-test)^2)/H
+  
+  aicc_1[i,1:length(test)] <- fit_1$aicc
+  aicc_2[i,1:length(test)] <- fit_2$aicc
+  aicc_3[i,1:length(test)] <- fit_3$aicc
+  aicc_4[i,1:length(test)] <- fit_4$aicc
+  aicc_5[i,1:length(test)] <- fit_5$aicc
+  aicc_6[i,1:length(test)] <- fit_6$aicc
+}
+
+# Plot MAPE vs Forecast horizon
+win.graph(width=6, height=4.5,pointsize=12)
+plot(1:12, colMeans(mape_1,na.rm=TRUE), type="l",col=1,xlab="horizon", ylab="MAPE",
+     ylim=c(1,3), main="MAPE vs Forecast horizon for 6 models")
+lines(1:12, colMeans(mape_2,na.rm=TRUE), type="l",col=2)
+lines(1:12, colMeans(mape_3,na.rm=TRUE), type="l",col=3)
+lines(1:12, colMeans(mape_4,na.rm=TRUE), type="l",col=4)
+lines(1:12, colMeans(mape_5,na.rm=TRUE), type="l",col=5)
+lines(1:12, colMeans(mape_6,na.rm=TRUE), type="l",col=6)
+legend("topleft",legend=c("ARIMA - Expanding Window","ARIMA - Sliding Window", 
+                          "ARIMA errors - Expanding Window", "ARIMA errors - Sliding Window",
+                          "Intervention - Expanding Window","Intervention - Sliding Window"),col=1:6,lty=1,
+       cex=0.7, pt.cex = 1)
+
+# Plot MSE vs Forecast horizon
+win.graph(width=6, height=4.5,pointsize=12)
+plot(1:12, colMeans(mse_1,na.rm=TRUE), type="l",col=1,xlab="horizon", ylab="MSE",
+     ylim=c(4,13), main="MSE vs Forecast horizon for 6 models")
+lines(1:12, colMeans(mse_2,na.rm=TRUE), type="l",col=2)
+lines(1:12, colMeans(mse_3,na.rm=TRUE), type="l",col=3)
+lines(1:12, colMeans(mse_4,na.rm=TRUE), type="l",col=4)
+lines(1:12, colMeans(mse_5,na.rm=TRUE), type="l",col=5)
+lines(1:12, colMeans(mse_6,na.rm=TRUE), type="l",col=6)
+legend("topleft",legend=c("ARIMA - Expanding Window","ARIMA - Sliding Window", 
+                          "ARIMA errors - Expanding Window", "ARIMA errors - Sliding Window",
+                          "Intervention - Expanding Window","Intervention - Sliding Window"),col=1:6,lty=1,
+       cex=0.7, pt.cex = 1)
+
+# Plot AICc vs Iteration number
+win.graph(width=6, height=4.5,pointsize=12)
+plot(1:12, rowMeans(aicc_1,na.rm=TRUE), type="l",col=1,xlab="iteration", ylab="AICc",
+     ylim=c(8800,9200), main="AICs vs Iteration number for 6 models")
+lines(1:12, rowMeans(aicc_2,na.rm=TRUE), type="l",col=2)
+lines(1:12, rowMeans(aicc_3,na.rm=TRUE), type="l",col=3)
+lines(1:12, rowMeans(aicc_4,na.rm=TRUE), type="l",col=4)
+lines(1:12, rowMeans(aicc_5,na.rm=TRUE), type="l",col=5)
+lines(1:12, rowMeans(aicc_6,na.rm=TRUE), type="l",col=6)
+legend("bottomleft",legend=c("ARIMA - Expanding Window","ARIMA - Sliding Window", 
+                          "ARIMA errors - Expanding Window", "ARIMA errors - Sliding Window",
+                          "Intervention - Expanding Window","Intervention - Sliding Window"),col=1:6,lty=1,
+       cex=0.6, pt.cex = 1)
+
+# Aggregate average MAE, MSE and AICc for each model
+error_table2 <- as.data.frame(rbind(c(round(mean(mape_1, na.rm=TRUE),4),round(mean(mse_1, na.rm=TRUE),4),
+                                     round(mean(aicc_1, na.rm=TRUE),4),"YES","YES"),
+                                   c(round(mean(mape_2, na.rm=TRUE),4),round(mean(mse_2, na.rm=TRUE),4),
+                                     round(mean(aicc_2, na.rm=TRUE),4),"YES","YES"),
+                                   c(round(mean(mape_3, na.rm=TRUE),4),round(mean(mse_3, na.rm=TRUE),4),
+                                     round(mean(aicc_3, na.rm=TRUE),4),"YES","NO"),
+                                   c(round(mean(mape_4, na.rm=TRUE),4),round(mean(mse_4, na.rm=TRUE),4),
+                                     round(mean(aicc_4, na.rm=TRUE),4),"YES","NO"),
+                                   c(round(mean(mape_5, na.rm=TRUE),4),round(mean(mse_5, na.rm=TRUE),4),
+                                     round(mean(aicc_5, na.rm=TRUE),4),"YES","YES"),
+                                   c(round(mean(mape_6, na.rm=TRUE),4),round(mean(mse_6, na.rm=TRUE),4),
+                                     round(mean(aicc_6, na.rm=TRUE),4),"YES","YES")),
+                             row.names = c("ARIMA-Expanding","ARIMA-Sliding", 
+                          "regr model (ARIMA errs)-Expanding", "regr model (ARIMA errs)-Sliding",
+                          "Intervention-Expanding","Intervention-Sliding"))
+
+colnames(error_table2) <- c("MAPE","MSE","AICc/AIC","Residual white noise","Coefficient significance")
+error_table_final2 <- rbind(error_table_final,error_table2)
+error_table_final2
+
+```
+As we can tell from table above, the MAPE and MSE are greatly reduced by expanding or sliding windows techniques. Meanwhile, the expanding window increases the AICc for the three models while sliding window keep the values almost the same. If our golden standard is still by comparing the AICc value, then intervention model beats all others. The intervention model with sliding window wins other models, with greatly reduced MAPE and MSE but slightly higher AICc.
